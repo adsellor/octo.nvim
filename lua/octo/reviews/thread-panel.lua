@@ -30,40 +30,46 @@ function M.show_review_threads(jump_to_buffer)
 
   local pr = file.pull_request
   local review_level = review:get_level()
-  ---@type octo.ReviewThread[]
-  local threads = vim.tbl_values(review.threads)
   local line = vim.api.nvim_win_get_cursor(0)[1]
 
   -- get threads associated with current line
-  local threads_at_cursor = {}
-  for _, thread in ipairs(threads) do
+  local threads_at_cursor = {} ---@type octo.forge.Thread[]
+  for _, thread in pairs(review.threads) do
+    local lines = review_level == "PR" and thread.lines
+      or review_level == "COMMIT" and review.layout.right.commit == thread.original_commit and thread.original_lines
     if
-      review_level == "PR"
+      lines
       and utils.is_thread_placed_in_buffer(thread, bufnr)
-      and thread.startLine <= line
-      and thread.line >= line
+      and (review_level == "PR" and lines.first <= line and lines.last >= line or lines.last == line)
     then
       table.insert(threads_at_cursor, thread)
-    elseif review_level == "COMMIT" then
-      for _, comment in ipairs(thread.comments.nodes) do
-        if
-          review.layout.right.commit == comment.originalCommit.oid
-          and utils.is_thread_placed_in_buffer(thread, bufnr)
-          and thread.originalLine == line
-        then
-          table.insert(threads_at_cursor, thread)
-          break
-        end
-      end
     end
   end
+  table.sort(threads_at_cursor, function(a, b)
+    local a_line = (a.original_lines or a.lines).first
+    local b_line = (b.original_lines or b.lines).first
+    if a_line ~= b_line then
+      return a_line < b_line
+    end
+    return a.id < b.id
+  end)
 
   -- render thread buffer if there are threads at the current line
   if #threads_at_cursor > 0 then
     review.layout:ensure_layout()
     local alt_win = file:get_alternative_win(split)
     if vim.api.nvim_win_is_valid(alt_win) then
-      local thread_buffer = M.create_thread_buffer(threads_at_cursor, pr.repo, pr.number, split, file.path)
+      for _, thread in ipairs(threads_at_cursor) do
+        -- forges that don't send the hunk around a thread get the one from this file's diff
+        if not thread.diff_hunk then
+          local lines = thread.original_lines or thread.lines --[[@as octo.forge.LineRange]]
+          thread.diff_hunk = file:hunk_at(thread.side, lines.first, lines.last)
+        end
+      end
+      local first = threads_at_cursor[1].original_lines or threads_at_cursor[1].lines --[[@as octo.forge.LineRange]]
+      local thread_buffer = M.create_thread_buffer(pr.repo, pr.number, split, file.path, first.first, function(bufnr)
+        require("octo.reviews.thread-buffer").write(bufnr, threads_at_cursor)
+      end)
       if thread_buffer then
         table.insert(file.associated_bufs, thread_buffer.bufnr)
         vim.api.nvim_win_set_buf(alt_win, thread_buffer.bufnr)
@@ -118,14 +124,15 @@ function M.hide_thread_buffer(split, file)
   end
 end
 
----Create a thread buffer
----@param threads ReviewThread[]
+---Create a thread buffer, or return the one already open for that place
 ---@param repo string
 ---@param number integer
 ---@param side string
 ---@param path string
+---@param line integer
+---@param write fun(bufnr: integer) writes the threads into the new buffer
 ---@return OctoBuffer | nil
-function M.create_thread_buffer(threads, repo, number, side, path)
+function M.create_thread_buffer(repo, number, side, path, line, write)
   local current_review = require("octo.reviews").get_current_review()
   if not current_review then
     return
@@ -134,8 +141,7 @@ function M.create_thread_buffer(threads, repo, number, side, path)
   if not vim.startswith(path, "/") then
     path = "/" .. path
   end
-  local line = threads[1].originalStartLine ~= vim.NIL and threads[1].originalStartLine or threads[1].originalLine
-  local bufname = string.format("octo://%s/review/%s/threads/%s%s:%d", repo, current_review.id, side, path, line)
+  local bufname = string.format("octo://%s/review/%d/threads/%s%s:%d", repo, number, side, path, line)
   local existing_bufnr = vim.fn.bufnr(bufname)
 
   if existing_bufnr ~= -1 then
@@ -154,7 +160,10 @@ function M.create_thread_buffer(threads, repo, number, side, path)
     number = number,
     repo = repo,
   }
-  buffer:render_threads(threads)
+  buffer:clear()
+  write(bufnr)
+  vim.bo[bufnr].modified = false
+  buffer.ready = true
   buffer:render_signs()
   vim.api.nvim_buf_call(bufnr, function()
     utils.clear_history()

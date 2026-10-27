@@ -2026,10 +2026,17 @@ function M.write_review_thread_header(bufnr, opts, line)
     { "[", "OctoSymbol" },
     { opts.path .. " ", "OctoDetailsLabel" },
     { tostring(opts.start_line) .. ":" .. tostring(opts.end_line), "OctoDetailsValue" },
-    { "] [Commit: ", "OctoSymbol" },
-    { opts.commit, "OctoDetailsLabel" },
-    { "] ", "OctoSymbol" },
   }
+  -- forges that don't record a thread's commit leave it out
+  if utils.is_blank(opts.commit) then
+    table.insert(header_vt, { "] ", "OctoSymbol" })
+  else
+    vim.list_extend(header_vt, {
+      { "] [Commit: ", "OctoSymbol" },
+      { opts.commit, "OctoDetailsLabel" },
+      { "] ", "OctoSymbol" },
+    })
+  end
   if opts.isOutdated then
     local outdated_bubble = bubbles.make_bubble("Outdated", "OctoBubbleYellow", { margin_width = 1 })
     vim.list_extend(header_vt, outdated_bubble)

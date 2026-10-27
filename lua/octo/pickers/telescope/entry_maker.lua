@@ -137,6 +137,43 @@ function M.gen_from_issue(max_number, print_repo)
   end
 end
 
+---Entries for a forge's pull request listing.
+---@param max_number integer digits in the widest number
+function M.gen_from_pull_request(max_number)
+  local pull_requests = require "octo.pull-requests"
+
+  local function make_display(entry)
+    local pr = entry.obj ---@type octo.forge.PullRequestSummary
+    local columns = {
+      { entry.value, "TelescopeResultsNumber" },
+      pull_requests.icon(pr),
+      { pr.title },
+    }
+    local layout = { separator = " ", items = { { width = max_number }, { width = 2 }, { remaining = true } } }
+    -- stacked PRs get a trailing greyed-out indicator column after the title
+    local stack_indicator = pull_requests.stack_indicator(pr)
+    if stack_indicator then
+      layout.items[#layout.items] = { width = vim.fn.strdisplaywidth(pr.title) + 1 }
+      table.insert(layout.items, { remaining = true })
+      table.insert(columns, { stack_indicator, "Comment" })
+    end
+    return entry_display.create(layout)(columns)
+  end
+
+  ---@param pr octo.forge.PullRequestSummary
+  return function(pr)
+    return {
+      filename = pull_requests.uri(pr),
+      kind = "pull_request",
+      value = pr.ref.number,
+      ordinal = pr.ref.number .. " " .. pr.title,
+      display = make_display,
+      obj = pr,
+      repo = pull_requests.repo_name(pr),
+    }
+  end
+end
+
 function M.gen_from_git_commits()
   local displayer = entry_display.create {
     separator = " ",
@@ -230,9 +267,9 @@ function M.gen_from_review_thread(linenr_length)
 
     local columns = {
       { entry.thread.path, "TelescopeResultsNumber" },
-      { entry.thread.diffSide },
-      { entry.thread.startLine },
-      { entry.thread.line },
+      { entry.thread.side },
+      { entry.lines.first },
+      { entry.lines.last },
     }
 
     local displayer = entry_display.create {
@@ -247,16 +284,19 @@ function M.gen_from_review_thread(linenr_length)
     return displayer(columns)
   end
 
+  ---@param thread octo.forge.Thread
   return function(thread)
     if not thread or vim.tbl_isempty(thread) then
       return nil
     end
 
+    local lines = thread.lines or thread.original_lines or { first = 1, last = 1 }
     return {
-      value = thread.path .. ":" .. thread.startLine .. ":" .. thread.line,
-      ordinal = thread.path .. ":" .. thread.startLine .. ":" .. thread.line,
+      value = thread.path .. ":" .. lines.first .. ":" .. lines.last,
+      ordinal = thread.path .. ":" .. lines.first .. ":" .. lines.last,
       display = make_display,
       thread = thread,
+      lines = lines,
     }
   end
 end

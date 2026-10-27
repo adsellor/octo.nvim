@@ -1,6 +1,7 @@
 ---@diagnostic disable
 ---Picker that uses vim.ui.select
 local notify = require "octo.notify"
+local pull_requests = require "octo.pull-requests"
 local utils = require "octo.utils"
 local gh = require "octo.gh"
 local queries = require "octo.gh.queries"
@@ -165,59 +166,40 @@ function M.issues(opts)
 end
 
 ---@param opts? {
----   repo: string,
----   states: string[],
+---   repo?: string,
+---   states?: string|string[],
+---   labels?: string|string[],
 ---   baseRefName?: string,
 ---   headRefName?: string,
----   labels?: string[],
----   states?: string[],
----   cb: function,
+---   cb?: fun(pr: octo.forge.PullRequestSummary),
 --- }
 function M.pull_requests(opts)
   opts = opts or {}
-
-  local owner, name = utils.split_repo(opts.repo or utils.get_remote_name())
-  utils.info "Fetching pull requests (this may take a while) ..."
-  gh.api.graphql {
-    query = queries.pull_requests,
-    F = {
-      owner = owner,
-      name = name,
-      base_ref_name = opts.baseRefName,
-      head_ref_name = opts.headRefName,
-      labels = opts.labels,
-      states = opts.states or { "OPEN" },
-      order_by = octo_config.values.pull_requests.order_by,
-    },
-    jq = ".",
-    paginate = true,
-    opts = {
-      cb = gh.create_callback {
-        success = function(data)
-          local resp = utils.aggregate_pages(data, "data.repository.pullRequests.nodes")
-          local pull_requests = resp.data.repository.pullRequests.nodes
-
-          vim.ui.select(pull_requests, {
-            prompt = "Select Pull Request:",
-            format_item = function(item)
-              local display = string.format("#%d %s [%s]", item.number, item.title, item.state)
-              local stack_indicator = utils.get_stack_indicator(item)
-              if stack_indicator then
-                display = display .. "  " .. stack_indicator
-              end
-              return display
-            end,
-          }, function(choice)
-            if not choice then
-              notify.error "No pull request selected"
-              return
-            end
-            utils.get("pull_request", choice.number, choice.repository.nameWithOwner)
-          end)
-        end,
-      },
-    },
-  }
+  local cb = utils.pop_key(opts, "cb")
+  pull_requests.list(opts, function(prs)
+    vim.ui.select(prs, {
+      prompt = "Select Pull Request:",
+      ---@param pr octo.forge.PullRequestSummary
+      format_item = function(pr)
+        local display = string.format("#%d %s [%s]", pr.ref.number, pr.title, pr.state:upper())
+        local stack_indicator = pull_requests.stack_indicator(pr)
+        if stack_indicator then
+          display = display .. "  " .. stack_indicator
+        end
+        return display
+      end,
+    }, function(choice)
+      if not choice then
+        notify.error "No pull request selected"
+        return
+      end
+      if cb then
+        cb(choice)
+      else
+        pull_requests.open(choice)
+      end
+    end)
+  end)
 end
 
 ---@param opts? { repo?: string, cb?: function }
@@ -337,30 +319,30 @@ function M.issue_templates(templates, cb)
   end)
 end
 
----@param threads table[]
+---@param threads octo.forge.Thread[]
 function M.pending_threads(threads)
+  ---@param thread octo.forge.Thread
+  local function lines_of(thread)
+    return thread.lines or thread.original_lines or { first = 1, last = 1 }
+  end
   vim.ui.select(threads, {
     prompt = "Select Pending Thread:",
     format_item = function(thread)
-      local start_line = not utils.is_blank(thread.startLine) and thread.startLine or thread.line
-      local end_line = thread.line
-      if start_line == end_line then
-        return string.format("%s:%d", thread.path, end_line)
+      local lines = lines_of(thread)
+      if lines.first == lines.last then
+        return string.format("%s:%d", thread.path, lines.last)
       else
-        return string.format("%s:%d-%d", thread.path, start_line, end_line)
+        return string.format("%s:%d-%d", thread.path, lines.first, lines.last)
       end
     end,
     preview_item = function(thread)
       local lines = {}
-      local start_line = not utils.is_blank(thread.startLine) and thread.startLine or thread.line
+      local range = lines_of(thread)
       table.insert(lines, string.format("File:  %s", thread.path or ""))
-      table.insert(lines, string.format("Lines: %d-%d", start_line, thread.line or start_line))
-      if thread.diffSide then
-        table.insert(lines, string.format("Side:  %s", thread.diffSide))
-      end
+      table.insert(lines, string.format("Lines: %d-%d", range.first, range.last))
+      table.insert(lines, string.format("Side:  %s", thread.side))
       table.insert(lines, "")
-      -- render comments if available
-      local comments = thread.comments and thread.comments.nodes or {}
+      local comments = thread.comments
       for i, comment in ipairs(comments) do
         local author = comment.author and comment.author.login or "unknown"
         table.insert(lines, string.format("[%d] %s:", i, author))

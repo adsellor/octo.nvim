@@ -157,6 +157,7 @@ end
 ---@field headers? string[]
 ---@field hostname? string
 ---@field debug? boolean
+---@field stdin? string written to the command's stdin, e.g. a request body for `--input -`
 ---@field [string] any
 
 ---Collect paginated `gh api --paginate` output into a JSON array, replicating
@@ -248,6 +249,7 @@ local function run(opts)
     enable_recording = true,
     command = config.values.gh_cmd,
     args = opts.args,
+    writer = opts.stdin,
     on_stdout = vim.schedule_wrap(function(err, data, _)
       if mode == "async" and opts.stream_cb then
         opts.stream_cb(data, err)

@@ -282,4 +282,20 @@ describe("string methods", function()
       eq(this.remove_underscore(input), expected)
     end)
   end)
+
+  describe("hunk headers", function()
+    it("reads ranges whose counts git left out", function()
+      local hunks, left, right =
+        this.process_patch "@@ -1,3 +1,4 @@\n a\n+b\n c\n d\n@@ -10 +11,2 @@\n-x\n+y\n+z\n@@ -20,2 +22 @@\n-p\n q"
+      eq(3, #hunks)
+      eq({ { 1, 3 }, { 10, 10 }, { 20, 21 } }, left)
+      eq({ { 1, 4 }, { 11, 12 }, { 22, 22 } }, right)
+    end)
+
+    it("maps snippet positions under a header without counts", function()
+      local map = this.generate_position2line_map "@@ -1 +1,2 @@\n-x\n+y\n+z"
+      eq({ [2] = 1 }, map.left_side_lines)
+      eq({ [3] = 1, [4] = 2 }, map.right_side_lines)
+    end)
+  end)
 end)

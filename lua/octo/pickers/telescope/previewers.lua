@@ -102,6 +102,19 @@ local issue = defaulter(function(opts)
   }
 end)
 
+---A forge's pull request listing, previewed from the listing itself.
+local pull_request = defaulter(function(opts)
+  return previewers.new_buffer_previewer {
+    title = opts.preview_title,
+    get_buffer_by_name = function(_, entry)
+      return entry.value
+    end,
+    define_preview = function(self, entry)
+      require("octo.pull-requests").preview(self.state.bufnr, entry.obj)
+    end,
+  }
+end)
+
 --- Supports Issues, Pull Requests, and Discussions
 local notification = defaulter(function(opts)
   return previewers.new_buffer_previewer {
@@ -210,7 +223,7 @@ local review_thread = defaulter(function(opts)
           bufnr = bufnr,
         }
         buffer:configure()
-        writers.write_threads(bufnr, { entry.thread })
+        require("octo.reviews.thread-buffer").write(bufnr, { entry.thread })
         vim.api.nvim_buf_call(bufnr, function()
           vim.cmd [[setlocal foldmethod=manual]]
           vim.cmd [[normal! zR]]
@@ -308,6 +321,7 @@ return {
   workflow_runs = workflow_runs,
   discussion = discussion,
   issue = issue,
+  pull_request = pull_request,
   gist = gist,
   commit = commit,
   changed_files = changed_files,

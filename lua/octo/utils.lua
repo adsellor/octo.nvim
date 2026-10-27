@@ -1,7 +1,6 @@
 local config = require "octo.config"
 local constants = require "octo.constants"
 local gh = require "octo.gh"
-local graphql = require "octo.gh.graphql"
 local queries = require "octo.gh.queries"
 local _, Job = pcall(require, "plenary.job")
 local release = require "octo.release"
@@ -1377,10 +1376,11 @@ function M.get_sorted_comment_lines(bufnr)
   return lines
 end
 
+---@param thread octo.forge.Thread
 ---@param bufnr integer
 function M.is_thread_placed_in_buffer(thread, bufnr)
   local split, path = M.get_split_and_path(bufnr)
-  if split == thread.diffSide and path == thread.path then
+  if split == thread.side and path == thread.path then
     return true
   end
   return false
@@ -1567,6 +1567,17 @@ function M.extract_diffhunks_from_diff(diff)
   return diffhunks
 end
 
+---A hunk header's ranges. Git leaves a count out when it is 1: "@@ -5 +5,2 @@".
+---@param header string the header, with or without its leading "@@"
+---@return integer?, integer, integer, integer left start and length, right start and length
+local function hunk_ranges(header)
+  local left_start, left_length, right_start, right_length = header:match "^@?@?%s*%-(%d+),?(%d*)%s+%+(%d+),?(%d*)%s*@@"
+  if not left_start then
+    return nil, 0, 0, 0
+  end
+  return tonumber(left_start), tonumber(left_length) or 1, tonumber(right_start) or 0, tonumber(right_length) or 1
+end
+
 ---Calculate valid comment ranges
 ---@param patch string?
 function M.process_patch(patch)
@@ -1586,22 +1597,11 @@ function M.process_patch(patch)
   local hunk_strings = vim.split(patch:gsub("^@@", ""), "\n@@")
   for _, hunk in ipairs(hunk_strings) do
     local header = vim.split(hunk, "\n")[1]
-    ---@type integer?, integer?, integer, integer, integer, integer
-    local found, _, left_start, left_length, right_start, right_length =
-      string.find(header, "^%s*%-(%d+),(%d+)%s+%+(%d+),(%d+)%s*@@")
-    if found then
+    local left_start, left_length, right_start, right_length = hunk_ranges(header)
+    if left_start then
       table.insert(hunks, hunk)
-      table.insert(left_ranges, { tonumber(left_start), math.max(left_start + left_length - 1, 0) })
-      table.insert(right_ranges, { tonumber(right_start), math.max(right_start + right_length - 1, 0) })
-    else
-      ---@type integer?, integer?, integer, integer, integer
-      found, _, left_start, left_length, right_start = string.find(header, "^%s*%-(%d+),(%d+)%s+%+(%d+)%s*@@")
-      if found then
-        right_length = right_start + 1
-        table.insert(hunks, hunk)
-        table.insert(left_ranges, { tonumber(left_start), math.max(left_start + left_length - 1, 0) })
-        table.insert(right_ranges, { tonumber(right_start), math.max(right_start + right_length - 1, 0) })
-      end
+      table.insert(left_ranges, { left_start, math.max(left_start + left_length - 1, 0) })
+      table.insert(right_ranges, { right_start, math.max(right_start + right_length - 1, 0) })
     end
   end
   return hunks, left_ranges, right_ranges
@@ -1675,78 +1675,69 @@ M.notify = notify.notify
 M.info = notify.info
 M.error = notify.error
 
----@param cb fun(pr: PullRequest):nil
+---The current branch as a pull request head: its name on the remote it tracks and that remote's
+---repository. Also the pull request number when the branch tracks `refs/pull/<n>/head`, as
+---`gh pr checkout` sets up for some pull requests.
+---@param host string
+---@return octo.forge.Head?, integer?
+local function current_head(host)
+  local function git(args)
+    local out = vim.trim(vim.fn.system(vim.list_extend({ "git" }, args)))
+    return vim.v.shell_error == 0 and out ~= "" and out or nil
+  end
+  local branch = git { "branch", "--show-current" }
+  if not branch then
+    return nil
+  end
+  local head = { name = branch } ---@type octo.forge.Head
+  local merge = git { "config", "--get", "branch." .. branch .. ".merge" }
+  if merge then
+    local number = merge:match "^refs/pull/(%d+)/head$"
+    if number then
+      return head, tonumber(number)
+    end
+    head.name = merge:match "^refs/heads/(.+)$" or branch
+  end
+  local remote = git { "config", "--get", "branch." .. branch .. ".remote" }
+  if remote and remote ~= "." then
+    -- a remote's name, or a fork's url when gh checked it out without adding a remote
+    local parsed = M.parse_git_remote()[remote] or M.parse_remote_url(remote, config.values.ssh_aliases)
+    local owner, name = M.split_repo(parsed and parsed.repo or "")
+    if owner and name then
+      head.repo = { host = host, owner = owner, name = name }
+    end
+  end
+  return head
+end
+
+---The pull request the current branch is the head of.
+---@param cb fun(pull_request: PullRequest)
 function M.get_pull_request_for_current_branch(cb)
-  gh.run {
-    args = { "pr", "view", "--json", "id,number,headRepositoryOwner,headRepository,isCrossRepository,url" },
-    cb = function(out)
-      if out == "" then
-        M.error "No pr found for current branch"
-        return
-      end
-      ---@class octo.PullRequestViewJson
-      ---@field id string
-      ---@field number integer
-      ---@field headRepositoryOwner { login: string, name: string }
-      ---@field headRepository { name: string }
-      ---@field isCrossRepository boolean
-      ---@field url string
-
-      ---@type octo.PullRequestViewJson
-      local pr = vim.json.decode(out)
-      local base_owner ---@type string
-      local base_name ---@type string
-      if pr.number then
-        if pr.isCrossRepository then
-          -- Parsing the pr url is the only way to get the target repo owner if the pr is cross repo
-          if not pr.url then
-            M.error "Failed to get pr url"
-            return
-          end
-          local url_suffix = pr.url:match "[^/]+/[^/]+/pull/%d+$"
-          if not url_suffix then
-            M.error "Failed to parse pr url"
-            return
-          end
-          ---@type fun(): string
-          local iter = url_suffix:gmatch "[^/]+/"
-          base_owner = iter():sub(1, -2)
-          base_name = iter():sub(1, -2)
-        else
-          base_owner = pr.headRepositoryOwner.login
-          base_name = pr.headRepository.name
-        end
-        local number = pr.number
-        local id = pr.id
-        local query = graphql("pull_request_query", base_owner, base_name, number, _G.octo_pv2_fragment)
-        gh.api.graphql {
-          f = { query = query },
-          paginate = true,
-          jq = ".",
-          opts = {
-            cb = gh.create_callback {
-              success = function(output)
-                local resp = M.aggregate_pages(output, "data.repository.pullRequest.timelineItems.nodes")
-                ---@type octo.PullRequest
-                local obj = resp.data.repository.pullRequest
-                local PullRequest = require "octo.model.pull-request"
-
-                local opts = {
-                  repo = base_owner .. "/" .. base_name,
-                  head_repo = obj.headRepository.nameWithOwner,
-                  number = number,
-                  id = id,
-                  head_ref_name = obj.headRefName,
-                }
-
-                PullRequest.create_with_merge_base(opts, obj, cb)
-              end,
-            },
-          },
-        }
-      end
-    end,
-  }
+  local forge = require "octo.forge"
+  local PullRequest = require "octo.model.pull-request"
+  local name_with_owner = M.get_remote_name()
+  if not name_with_owner then
+    M.error "No remote repository found"
+    return
+  end
+  local repo = forge.repo(name_with_owner)
+  local head, number = current_head(repo.host)
+  if number then
+    return PullRequest.load({ repo = name_with_owner, number = number, hostname = repo.host }, cb)
+  end
+  if not head then
+    M.error "Not on a branch"
+    return
+  end
+  forge.get(repo):pull_requests(repo, { head = head }, function(err, prs)
+    if err then
+      return M.error(err)
+    end
+    if not prs or #prs == 0 then
+      return M.error "No pr found for current branch"
+    end
+    PullRequest.load({ repo = name_with_owner, number = prs[1].ref.number, hostname = repo.host }, cb)
+  end)
 end
 
 ---@param winnr integer
@@ -1842,8 +1833,8 @@ end
 function M.generate_position2line_map(diffhunk)
   local diffhunk_lines = vim.split(diffhunk, "\n")
   local diff_directive = diffhunk_lines[1]
-  ---@type integer, integer
-  local left_offset, right_offset = string.match(diff_directive, "@@%s*%-(%d+),%d+%s%+(%d+)")
+  local left_offset, _, right_offset = hunk_ranges(diff_directive)
+  left_offset = left_offset or 0
   local right_side_lines = {} ---@type table<integer, integer>
   local left_side_lines = {} ---@type table<integer, integer>
   local right_side_line = right_offset

@@ -1,28 +1,21 @@
 local Layout = require("octo.reviews.layout").Layout
 local Rev = require("octo.reviews.rev").Rev
 local config = require "octo.config"
-local gh = require "octo.gh"
-local queries = require "octo.gh.queries"
-local graphql = require "octo.gh.graphql"
 local thread_panel = require "octo.reviews.thread-panel"
 local window = require "octo.ui.window"
 local utils = require "octo.utils"
-local ReviewThread = require("octo.reviews.thread").ReviewThread
 
 ---@alias ReviewLevel "COMMIT" | "PR"
 
+---A pull request opened for review. While browsing, threads can be read but not added to; once
+---started, new comments are drafts in the viewer's pending review on the forge.
 ---@class Review
----@field repo string
----@field number integer
----@field id string|-1
----@field threads octo.ReviewThread[]
----@field files FileEntry[]
+---@field started boolean
+---@field threads table<string, octo.forge.Thread> threads that aren't outdated, by id
 ---@field layout Layout
 ---@field pull_request PullRequest
 local Review = {}
 Review.__index = Review
-
-local default_id = -1
 
 ---Review constructor.
 ---@param pull_request PullRequest
@@ -30,128 +23,97 @@ local default_id = -1
 function Review:new(pull_request)
   local this = {
     pull_request = pull_request,
-    id = default_id,
+    started = false,
     threads = {},
-    files = {},
   }
   setmetatable(this, self)
   return this
 end
 
----Creates a new review
----@param callback fun(obj: octo.mutations.StartReview): nil
-function Review:create(callback)
-  local query = graphql("start_review_mutation", self.pull_request.id)
-  gh.api.graphql {
-    f = { query = query },
-    opts = {
-      cb = gh.create_callback {
-        success = function(output)
-          local resp = vim.json.decode(output)
-          callback(resp)
-        end,
-      },
-    },
-  }
+---Read the pull request's threads from the forge.
+---@param cb fun(threads: octo.forge.Thread[])
+function Review:fetch_threads(cb)
+  local pr = self.pull_request
+  pr.forge:threads(pr.ref, function(err, threads)
+    if err then
+      return utils.error(err)
+    end
+    cb(threads --[[@as octo.forge.Thread[] ]])
+  end)
 end
 
----Get review threads without start a review.
----@param callback fun(obj: octo.queries.ReviewThreads): nil
-function Review:populate_threads(callback)
-  gh.api.graphql {
-    query = queries.review_threads,
-    F = { owner = self.pull_request.owner, name = self.pull_request.name, number = self.pull_request.number },
-    opts = {
-      cb = function(output, stderr)
-        if stderr and not utils.is_blank(stderr) then
-          utils.error(stderr)
-        elseif output then
-          local resp = vim.json.decode(output)
-          callback(resp)
-        end
-      end,
-    },
-  }
+---Re-read the threads and redraw what shows them.
+---@param cb? fun()
+function Review:refresh_threads(cb)
+  self:fetch_threads(function(threads)
+    self:update_threads(threads)
+    if cb then
+      cb()
+    end
+  end)
+end
+
+---@param threads octo.forge.Thread[]
+---@return integer count the viewer's pending comments with something in them
+local function count_pending_comments(threads)
+  local count = 0
+  for _, thread in ipairs(threads) do
+    for _, comment in ipairs(thread.comments) do
+      if comment.pending and not utils.is_blank(utils.trim(comment.body)) then
+        count = count + 1
+      end
+    end
+  end
+  return count
+end
+
+---@param started boolean
+---@param on_threads? fun(threads: octo.forge.Thread[]): boolean? return false to not open the review
+function Review:open(started, on_threads)
+  self:fetch_threads(function(threads)
+    if on_threads and on_threads(threads) == false then
+      return
+    end
+    self.started = started
+    self:update_threads(threads)
+    self:initiate()
+  end)
 end
 
 function Review:browse()
-  self:populate_threads(function(resp)
-    local threads = resp.data.repository.pullRequest.reviewThreads.nodes
-    self:update_threads(threads)
-    self:initiate()
-  end)
+  self:open(false)
 end
 
--- Starts a new review
+-- Starts a new review. Nothing is created on the forge until the first draft comment.
 function Review:start()
-  self:create(function(resp)
-    self.id = resp.data.addPullRequestReview.pullRequestReview.id
-    local threads = resp.data.addPullRequestReview.pullRequestReview.pullRequest.reviewThreads.nodes
-    self:update_threads(threads)
-    self:initiate()
-  end)
+  if self.layout then
+    -- already browsing this pull request: start reviewing in place
+    self.started = true
+    utils.info "Review started"
+    self:refresh_threads()
+    return
+  end
+  self:open(true)
 end
 
----Retrieves existing review
----@param callback fun(obj: octo.queries.PendingReviewThreads): nil
-function Review:retrieve(callback)
-  gh.api.graphql {
-    query = queries.pending_review_threads,
-    F = { owner = self.pull_request.owner, name = self.pull_request.name, number = self.pull_request.number },
-    opts = {
-      cb = gh.create_callback {
-        success = function(output)
-          local resp = vim.json.decode(output)
-          callback(resp)
-        end,
-      },
-    },
-  }
-end
-
--- Resumes an existing review
+-- Resumes the viewer's pending review
 function Review:resume()
-  self:retrieve(function(resp)
-    -- There can only be one pending review for a given user, stop at the first one
-    for _, review in ipairs(resp.data.repository.pullRequest.reviews.nodes) do
-      if review.viewerDidAuthor then
-        self.id = review.id
-        break
-      end
-    end
-
-    if self.id == default_id then
+  self:open(true, function(threads)
+    if count_pending_comments(threads) == 0 then
       utils.error "No pending reviews found for viewer"
-      return
+      return false
     end
-
-    local threads = resp.data.repository.pullRequest.reviewThreads.nodes
-    self:update_threads(threads)
-    self:initiate()
   end)
 end
 
--- Resumes an existing review if there is any, else start one
+-- Resumes a pending review if there is one, else starts one
 function Review:start_or_resume()
-  self:retrieve(function(resp)
-    -- There can only be one pending review for a given user
-    for _, review in ipairs(resp.data.repository.pullRequest.reviews.nodes) do
-      if review.viewerDidAuthor then
-        self.id = review.id
-        break
-      end
-    end
-
-    if self.id == default_id then
+  self:open(true, function(threads)
+    if count_pending_comments(threads) == 0 then
       utils.info "No pending review, starting one"
-      self:start()
-      return
+    else
+      utils.info "Resuming review"
     end
-
-    utils.info "Resuming review"
-    local threads = resp.data.repository.pullRequest.reviewThreads.nodes
-    self:update_threads(threads)
-    self:initiate()
   end)
 end
 
@@ -201,7 +163,7 @@ function Review:focus_commit(right, left)
   if right == self.pull_request.right.commit and left == self.pull_request.left.commit then
     pr:get_changed_files(cb)
   else
-    pr:get_commit_changed_files(self.layout.right, cb)
+    pr:get_commit_changed_files(self.layout.left, self.layout.right, cb)
   end
 end
 
@@ -231,94 +193,37 @@ function Review:initiate(opts)
   end)
 end
 
----Counts pending comments with non-empty bodies in review threads
----@see octo.PullRequestReviewState for explanation of why we check pullRequestReview.state
----@param threads octo.ReviewThread[]
----@return integer count The number of pending comments with content
-local function count_pending_comments(threads)
-  local count = 0
-  for _, thread in ipairs(threads) do
-    for _, comment in ipairs(thread.comments.nodes) do
-      if comment.pullRequestReview.state == "PENDING" and not utils.is_blank(utils.trim(comment.body)) then
-        count = count + 1
-      end
-    end
-  end
-  return count
-end
-
----Discard the current review
+---Discard the viewer's pending comments and close the review
 ---@param opts? { skip_confirm?: boolean } Options for discarding the review
 function Review:discard(opts)
   opts = opts or {}
-  local skip_confirm = opts.skip_confirm or false
-
-  gh.api.graphql {
-    query = queries.pending_review_threads,
-    F = { owner = self.pull_request.owner, name = self.pull_request.name, number = self.pull_request.number },
-    opts = {
-      cb = function(output, stderr)
-        if stderr and not utils.is_blank(stderr) then
-          utils.error(stderr)
-        elseif output then
-          ---@type octo.queries.PendingReviewThreads
-          local resp = vim.json.decode(output)
-          if #resp.data.repository.pullRequest.reviews.nodes == 0 then
-            utils.error "No pending reviews found"
-            return
-          end
-          self.id = resp.data.repository.pullRequest.reviews.nodes[1].id
-
-          local pending_count = count_pending_comments(resp.data.repository.pullRequest.reviewThreads.nodes)
-          local choice = 1
-          if pending_count > 0 and not skip_confirm then
-            local message = string.format(
-              "%d pending comment%s will be deleted, are you sure?",
-              pending_count,
-              pending_count == 1 and "" or "s"
-            )
-            choice = vim.fn.confirm(message, "&Yes\n&No\n&Cancel", 2)
-          end
-
-          if choice == 1 then
-            local delete_query = graphql("delete_pull_request_review_mutation", self.id --[[@as string]])
-            gh.api.graphql {
-              f = { query = delete_query },
-              opts = {
-                cb = gh.create_callback {
-                  success = function()
-                    self.id = default_id
-                    self.threads = {}
-                    self.files = {}
-                    utils.info "Pending review discarded"
-                    vim.cmd [[tabclose]]
-                  end,
-                },
-              },
-            }
-          end
-        end
-      end,
-    },
-  }
+  local pr = self.pull_request
+  self:fetch_threads(function(threads)
+    local pending_count = count_pending_comments(threads)
+    if pending_count > 0 and not opts.skip_confirm then
+      local message = string.format(
+        "%d pending comment%s will be deleted, are you sure?",
+        pending_count,
+        pending_count == 1 and "" or "s"
+      )
+      if vim.fn.confirm(message, "&Yes\n&No\n&Cancel", 2) ~= 1 then
+        return
+      end
+    end
+    pr.forge:discard(pr.ref, function(err)
+      if err then
+        return utils.error(err)
+      end
+      self.started = false
+      self.threads = {}
+      utils.info "Pending review discarded"
+      vim.cmd [[tabclose]]
+    end)
+  end)
 end
 
----@param threads octo.ReviewThread[]
-function Review:update_threads(threads)
-  self.threads = {}
-  for _, thread in ipairs(threads) do
-    if thread.line == vim.NIL then
-      thread.line = thread.originalLine
-    end
-    if thread.startLine == vim.NIL then
-      thread.startLine = thread.line
-      thread.startDiffSide = thread.diffSide
-      thread.originalStartLine = thread.originalLine
-    end
-    if not thread.isOutdated then
-      self.threads[thread.id] = thread
-    end
-  end
+---Redraw the file panel and the current file's signs after threads changed.
+function Review:redraw_threads()
   if self.layout then
     self.layout.file_panel:render()
     self.layout.file_panel:redraw()
@@ -329,8 +234,41 @@ function Review:update_threads(threads)
   end
 end
 
+---@param threads octo.forge.Thread[]
+function Review:update_threads(threads)
+  self.threads = {}
+  for _, thread in ipairs(threads) do
+    if not thread.outdated then
+      self.threads[thread.id] = thread
+    end
+  end
+  self:redraw_threads()
+end
+
+---Take in one thread the forge just returned.
+---@param thread octo.forge.Thread
+function Review:update_thread(thread)
+  if not thread.outdated then
+    self.threads[thread.id] = thread
+  end
+  self:redraw_threads()
+end
+
+---Take in one comment the forge just returned.
+---@param comment octo.forge.Comment
+function Review:update_comment(comment)
+  for _, thread in pairs(self.threads) do
+    for i, c in ipairs(thread.comments) do
+      if c.id == comment.id then
+        thread.comments[i] = comment
+      end
+    end
+  end
+  self:redraw_threads()
+end
+
 function Review:collect_submit_info()
-  if self.id == default_id then
+  if not self.started then
     utils.error "No review in progress"
     return
   end
@@ -350,44 +288,44 @@ function Review:collect_submit_info()
   vim.cmd [[normal G]]
 end
 
+local verdicts = { APPROVE = "approve", COMMENT = "comment", REQUEST_CHANGES = "request_changes" }
+
 ---@param event "APPROVE" | "COMMENT" | "REQUEST_CHANGES"
 function Review:submit(event)
-  local review_id = self.id
-  if review_id == -1 then
+  if not self.started then
     utils.error "No review in progress"
     return
   end
-  review_id = review_id --[[@as string]]
+  local pr = self.pull_request
   local bufnr = vim.api.nvim_get_current_buf()
   local winid = vim.api.nvim_get_current_win()
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, default_id, false)
-  local body = utils.escape_char(utils.trim(table.concat(lines, "\n")))
-  local query = graphql("submit_pull_request_review_mutation", review_id, event, body, { escape = false })
-  gh.api.graphql {
-    f = { query = query },
-    opts = {
-      cb = gh.create_callback {
-        success = function()
-          utils.info "Review was submitted successfully!"
-          pcall(vim.api.nvim_win_close, winid, 0)
-          self.layout:close()
-        end,
-      },
-    },
-  }
+  local body = utils.trim(table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n"))
+  pr.forge:submit(pr.ref, verdicts[event], body, function(err)
+    if err then
+      return utils.error(err)
+    end
+    utils.info "Review was submitted successfully!"
+    pcall(vim.api.nvim_win_close, winid, false)
+    self.layout:close()
+  end)
 end
 
-function Review:show_pending_comments()
-  local pending_threads = {}
-  for _, thread in
-    ipairs(vim.tbl_values(self.threads) --[[@as octo.ReviewThread[] ]])
-  do
-    for _, comment in ipairs(thread.comments.nodes) do
-      if comment.pullRequestReview.state == "PENDING" and not utils.is_blank(utils.trim(comment.body)) then
-        table.insert(pending_threads, thread)
+---@return octo.forge.Thread[]
+function Review:pending_threads()
+  local pending = {} ---@type octo.forge.Thread[]
+  for _, thread in pairs(self.threads) do
+    for _, comment in ipairs(thread.comments) do
+      if comment.pending and not utils.is_blank(utils.trim(comment.body)) then
+        table.insert(pending, thread)
+        break
       end
     end
   end
+  return pending
+end
+
+function Review:show_pending_comments()
+  local pending_threads = self:pending_threads()
   if #pending_threads == 0 then
     utils.error "No pending comments found"
     return
@@ -419,36 +357,26 @@ function Review:add_comment(isSuggestion)
     line1 = OctoLastCmdOpts.line1
     line2 = OctoLastCmdOpts.line2
   end
-
-  ---@type [integer, integer][], integer
-  local comment_ranges, current_bufnr
-  if split == "RIGHT" then
-    comment_ranges = file.right_comment_ranges
-    current_bufnr = file.right_bufid
-  elseif split == "LEFT" then
-    comment_ranges = file.left_comment_ranges
-    current_bufnr = file.left_bufid
-  else
+  if not line1 or not line2 then
     return
   end
-  if not current_bufnr or not comment_ranges then
+
+  local current_bufnr = split == "RIGHT" and file.right_bufid or split == "LEFT" and file.left_bufid or nil
+  if not current_bufnr then
     utils.error "Failed to create comment"
     return
   end
 
-  local diff_hunk ---@type string
-  for i, range in ipairs(comment_ranges) do
-    if range[1] <= line1 and range[2] >= line2 then
-      diff_hunk = file.diffhunks[i]
-      break
-    end
-  end
+  local diff_hunk = file:hunk_at(split, line1, line2)
   if not diff_hunk then
     utils.error "Cannot place comments outside diff hunks"
     return
   end
-  if not vim.startswith(diff_hunk, "@@") then
-    diff_hunk = "@@ " .. diff_hunk
+
+  local forge = self.pull_request.forge
+  if self:get_level() == "COMMIT" and not forge:supports "commit_comments" then
+    utils.error "This forge can't comment on a single commit; review the whole pull request to comment"
+    return
   end
 
   self.layout:ensure_layout()
@@ -456,44 +384,30 @@ function Review:add_comment(isSuggestion)
   local alt_win = file:get_alternative_win(split)
   if vim.api.nvim_win_is_valid(alt_win) then
     local pr = file.pull_request
-
-    -- create a thread stub representing the new comment
-
-    ---@type string, string
-    local commit, commit_abbrev
-    if split == "LEFT" then
-      commit = self.layout.left.commit
-      commit_abbrev = self.layout.left:abbrev()
-    elseif split == "RIGHT" then
-      commit = self.layout.right.commit
-      commit_abbrev = self.layout.right:abbrev()
-    end
-    local threads = {
-      ReviewThread:stub {
-        line1 = line1,
-        line2 = line2,
-        file_path = file.path,
-        split = split,
-        diff_hunk = diff_hunk,
-        commit = commit,
-        commit_abbrev = commit_abbrev,
-        review_id = self.id,
-      },
-    }
+    ---@type octo.forge.LineRange
+    local lines = { first = line1, last = line2 }
 
     -- Make sure review thread panel is visible if not already
     -- The thread panel could be hidden if user has `reviews.auto_show_threads` set to false in their config
     -- or, less likely, if the add comment command is invoked before the autocmd has concluded,
     thread_panel.show_review_threads(false)
-    local thread_buffer = thread_panel.create_thread_buffer(threads, pr.repo, pr.number, split, file.path)
+    local thread_buffer = thread_panel.create_thread_buffer(pr.repo, pr.number, split, file.path, line1, function(bufnr)
+      require("octo.reviews.thread-buffer").write_new(bufnr, {
+        path = file.path,
+        side = split --[[@as octo.forge.Side]],
+        lines = lines,
+        commit = split == "LEFT" and self.layout.left.commit or self.layout.right.commit,
+        diff_hunk = diff_hunk,
+      })
+    end)
     if thread_buffer then
       table.insert(file.associated_bufs, thread_buffer.bufnr)
       vim.api.nvim_win_set_buf(alt_win, thread_buffer.bufnr)
       vim.api.nvim_set_current_win(alt_win)
       if isSuggestion then
-        local lines = vim.api.nvim_buf_get_lines(current_bufnr, line1 - 1, line2 --[[@as integer]], false)
+        local code = vim.api.nvim_buf_get_lines(current_bufnr, line1 - 1, line2 --[[@as integer]], false)
         local suggestion = { "```suggestion" }
-        vim.list_extend(suggestion, lines)
+        vim.list_extend(suggestion, code)
         table.insert(suggestion, "```")
         vim.api.nvim_buf_set_lines(thread_buffer.bufnr, -3, -2, false, suggestion)
         vim.bo[thread_buffer.bufnr].modified = false
@@ -544,7 +458,7 @@ function M.add_review_comment(isSuggestion)
   end
 
   -- we maybe in browse mode, where no review has been started.
-  if review.id == -1 then
+  if not review.started then
     utils.error "Please start or resume a review first"
     return
   end
@@ -552,7 +466,7 @@ function M.add_review_comment(isSuggestion)
   review:add_comment(isSuggestion)
 end
 
----@param thread ReviewThread
+---@param thread octo.forge.Thread
 function M.jump_to_pending_review_thread(thread)
   local current_review = M.get_current_review()
   if not current_review then
@@ -562,13 +476,14 @@ function M.jump_to_pending_review_thread(thread)
     if thread.path == file.path then
       current_review.layout:ensure_layout()
       current_review.layout:set_current_file(file)
-      local win = file:get_win(thread.diffSide)
+      local win = file:get_win(thread.side:lower() --[[@as OctoSplit]])
       if vim.api.nvim_win_is_valid(win) then
         local review_level = current_review:get_level()
         -- jumping to the original position in case we are reviewing any commit
         -- jumping to the PR position if we are reviewing the last commit
         -- This may result in a jump to the wrong line when the review is neither in the last commit or the original one
-        local line = review_level == "COMMIT" and thread.originalStartLine or thread.startLine
+        local lines = review_level == "COMMIT" and thread.original_lines or thread.lines or thread.original_lines
+        local line = lines and lines.first or 1
         vim.api.nvim_set_current_win(win)
         vim.api.nvim_win_set_cursor(win, { line, 0 })
       else
@@ -648,7 +563,7 @@ end
 function M.browse_review()
   local current_review = M.get_current_review()
 
-  if current_review and current_review.id ~= -1 then
+  if current_review and current_review.started then
     utils.error "Cannot browse when a review has been started"
     return
   end
@@ -687,9 +602,19 @@ function M.start_or_resume_review()
   end)
 end
 
+---Start or resume a review of a pull request picked by number; it needn't be checked out.
+---@param ref octo.forge.PullRequestRef
+function M.review_pull_request(ref)
+  local PullRequest = require "octo.model.pull-request"
+  local name_with_owner = ref.repo.owner .. "/" .. ref.repo.name
+  PullRequest.load({ repo = name_with_owner, number = ref.number, hostname = ref.repo.host }, function(pull_request)
+    Review:new(pull_request):start_or_resume()
+  end)
+end
+
 function M.discard_review()
   local current_review = M.get_current_review()
-  if current_review and current_review.id ~= -1 then
+  if current_review and current_review.started then
     current_review:discard()
   else
     utils.error "Please start or resume a review first"
@@ -698,7 +623,7 @@ end
 
 function M.submit_review()
   local current_review = M.get_current_review()
-  if current_review and current_review.id ~= -1 then
+  if current_review and current_review.started then
     current_review:collect_submit_info()
   else
     utils.error "Please start or resume a review first"

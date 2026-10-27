@@ -3,8 +3,6 @@
 
 local config = require "octo.config"
 local constants = require "octo.constants"
-local gh = require "octo.gh"
-local mutations = require "octo.gh.mutations"
 local signs = require "octo.ui.signs"
 local utils = require "octo.utils"
 local vim = vim
@@ -122,36 +120,23 @@ end
 
 ---FileEntry toggle_viewed
 function FileEntry:toggle_viewed()
-  ---@type string, string
-  local query, next_state
-  if self.viewed_state == "VIEWED" then
-    query = mutations.unmark_file_as_viewed
-    next_state = "UNVIEWED"
-  elseif self.viewed_state == "UNVIEWED" then
-    query = mutations.mark_file_as_viewed
-    next_state = "VIEWED"
-  elseif self.viewed_state == "DISMISSED" then
-    query = mutations.mark_file_as_viewed
-    next_state = "VIEWED"
+  local pr = self.pull_request
+  if not pr.forge:supports "viewed" then
+    utils.error "This forge doesn't track viewed files"
+    return
   end
-
-  gh.api.graphql {
-    query = query,
-    F = { path = self.path, pullRequestId = self.pull_request.id },
-    opts = {
-      cb = gh.create_callback {
-        failure = utils.print_err,
-        success = function()
-          self.viewed_state = next_state
-          local current_review = require("octo.reviews").get_current_review()
-          if current_review then
-            current_review.layout.file_panel:render()
-            current_review.layout.file_panel:redraw()
-          end
-        end,
-      },
-    },
-  }
+  local viewed = self.viewed_state ~= "VIEWED"
+  pr.forge:set_viewed(pr.ref, self.path, viewed, function(err)
+    if err then
+      return utils.print_err(err)
+    end
+    self.viewed_state = viewed and "VIEWED" or "UNVIEWED"
+    local current_review = require("octo.reviews").get_current_review()
+    if current_review then
+      current_review.layout.file_panel:render()
+      current_review.layout.file_panel:redraw()
+    end
+  end)
 end
 
 ---FileEntry finalizer
@@ -215,7 +200,7 @@ function FileEntry:get_buf(split)
   return self.right_bufid
 end
 
----Fetch file content locally or from GitHub.
+---Fetch file content locally or from the forge.
 ---@param sync boolean
 function FileEntry:fetch(sync)
   local right_path = self.path
@@ -243,35 +228,38 @@ function FileEntry:fetch(sync)
     left_path = self.previous_path
   end
 
-  -- fetch right version
-  if self.pull_request.local_right then
-    utils.get_file_at_commit(right_path, right_sha, function(lines)
-      self.right_lines = lines
-      self.right_fetched = true
-      self.right_fetching = false
-    end)
-  else
-    utils.get_file_contents(self.pull_request.repo, right_sha, right_path, function(lines)
-      self.right_lines = lines
-      self.right_fetched = true
-      self.right_fetching = false
+  local pr = self.pull_request
+  ---@param is_local boolean
+  ---@param path string
+  ---@param sha string
+  ---@param done fun(lines: string[])
+  local function read(is_local, path, sha, done)
+    if is_local then
+      return utils.get_file_at_commit(path, sha, done)
+    end
+    pr.forge:contents(pr.ref, sha, path, function(err, text)
+      if err then
+        utils.error(err)
+      end
+      local lines = vim.split(text or "", "\n")
+      -- a final newline ends the last line; git doesn't count an empty one after it
+      if lines[#lines] == "" then
+        table.remove(lines)
+      end
+      done(lines)
     end)
   end
 
-  -- fetch left version
-  if self.pull_request.local_left then
-    utils.get_file_at_commit(left_path, left_sha, function(lines)
-      self.left_lines = lines
-      self.left_fetched = true
-      self.left_fetching = false
-    end)
-  else
-    utils.get_file_contents(self.pull_request.repo, left_sha, left_path, function(lines)
-      self.left_lines = lines
-      self.left_fetched = true
-      self.left_fetching = false
-    end)
-  end
+  read(pr.local_right, right_path, right_sha, function(lines)
+    self.right_lines = lines
+    self.right_fetched = true
+    self.right_fetching = false
+  end)
+  read(pr.local_left, left_path, left_sha, function(lines)
+    self.left_lines = lines
+    self.left_fetched = true
+    self.left_fetching = false
+  end)
 
   -- wait until we have both versions
   if sync then
@@ -291,6 +279,7 @@ end
 ---@param left_winid integer
 ---@param right_winid integer
 function FileEntry:load_buffers(left_winid, right_winid)
+  local current_review = require("octo.reviews").get_current_review()
   local empty_files = #self.left_lines == 0 and #self.right_lines == 0
   local splits = {
     {
@@ -317,6 +306,7 @@ function FileEntry:load_buffers(left_winid, right_winid)
 
       -- create buffer
       split.bufid = M._create_buffer {
+        commit = current_review and current_review.layout[split.pos].commit,
         status = self.status,
         show_diff = self.patch ~= nil,
         path = self.path,
@@ -406,6 +396,21 @@ function FileEntry:compare(other)
 end
 
 ---Update thread signs in diff buffers.
+---The diff hunk that holds lines `first` to `last` on `split`, starting with its "@@" header.
+---@param split string "LEFT" or "RIGHT"
+---@param first integer
+---@param last integer
+---@return string?
+function FileEntry:hunk_at(split, first, last)
+  local ranges = split == "RIGHT" and self.right_comment_ranges or split == "LEFT" and self.left_comment_ranges or nil
+  for i, range in ipairs(ranges or {}) do
+    if range[1] <= first and range[2] >= last then
+      local hunk = self.diffhunks[i]
+      return vim.startswith(hunk, "@@") and hunk or "@@ " .. hunk
+    end
+  end
+end
+
 function FileEntry:place_signs()
   self:_place_signs_with_virtual_text(config.values.reviews.show_virtual_text)
 end
@@ -442,31 +447,31 @@ function FileEntry:_place_signs_with_virtual_text(show_virtual_text)
     end
 
     -- place thread comments signs and virtual text
-    ---@type octo.ReviewThread[]
-    local threads = vim.tbl_values(current_review.threads)
-    for _, thread in ipairs(threads) do
-      local startLine, endLine = thread.startLine, thread.line
+    for _, thread in pairs(current_review.threads) do
+      local lines = thread.lines or thread.original_lines or { first = 1, last = 1 }
+      local startLine, endLine = lines.first, lines.last
       if review_level == "COMMIT" then
-        startLine = thread.originalLine
-        endLine = thread.originalLine
+        local original = thread.original_lines or lines
+        startLine = original.last
+        endLine = original.last
       end
 
       local sign = "octo_thread"
-      if thread.isOutdated then
+      if thread.outdated then
         sign = sign .. "_outdated"
-      elseif thread.isResolved then
+      elseif thread.resolved then
         sign = sign .. "_resolved"
       end
 
-      for _, comment in ipairs(thread.comments.nodes) do
-        if comment.state == "PENDING" then
+      for _, comment in ipairs(thread.comments) do
+        if comment.pending then
           sign = sign .. "_pending"
         end
         if
           (review_level == "PR" and utils.is_thread_placed_in_buffer(thread, split.bufnr))
           or (
             review_level == "COMMIT"
-            and current_review.layout.right.commit == comment.originalCommit.oid
+            and current_review.layout.right.commit == thread.original_commit
             and utils.is_thread_placed_in_buffer(thread, split.bufnr)
           )
         then
@@ -477,8 +482,8 @@ function FileEntry:_place_signs_with_virtual_text(show_virtual_text)
 
           -- place the virtual text only on first line
           if show_virtual_text then
-            local last_date = comment.lastEditedAt ~= vim.NIL and comment.lastEditedAt or comment.createdAt
-            local comments_count = #thread.comments.nodes
+            local last_date = comment.edited_at or comment.created_at
+            local comments_count = #thread.comments
             local comments_word = comments_count == 1 and "comment" or "comments"
             local vt_msg = string.format("    %d %s (%s)", comments_count, comments_word, utils.format_date(last_date))
             local opts = {
@@ -506,6 +511,7 @@ end
 
 ---@param opts {
 ---  use_local: boolean,
+---  commit?: string,
 ---  path: string,
 ---  status: string,
 ---  show_diff: boolean,
@@ -529,7 +535,8 @@ function M._create_buffer(opts)
     vim.bo[bufnr].buflisted = true
   else
     local bufname =
-      string.format("octo://%s/review/%s/file/%s/%s", opts.repo, current_review.id, string.upper(opts.split), opts.path)
+      -- what a buffer shows is fixed by repo, commit and path, so a buffer by that name can be reused
+      string.format("octo://%s/review/%s/file/%s/%s", opts.repo, opts.commit or "", string.upper(opts.split), opts.path)
     local existing_bufnr = utils.find_named_buffer(bufname)
     if existing_bufnr then
       -- Buffer already exists, most likely because review is already opened

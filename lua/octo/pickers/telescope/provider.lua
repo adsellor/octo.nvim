@@ -6,6 +6,7 @@ local queries = require "octo.gh.queries"
 local parser = require "octo.gh.parser"
 local navigation = require "octo.navigation"
 local previewers = require "octo.pickers.telescope.previewers"
+local pull_requests = require "octo.pull-requests"
 local entry_maker = require "octo.pickers.telescope.entry_maker"
 local reviews = require "octo.reviews"
 local utils = require "octo.utils"
@@ -297,104 +298,68 @@ local function merge_pull_request()
   end
 end
 
----@param opts { repo: string, states: string[], cb: function }
+---@param opts? {
+---   repo?: string,
+---   states?: string|string[],
+---   labels?: string|string[],
+---   baseRefName?: string,
+---   headRefName?: string,
+---   cb?: fun(pr: octo.forge.PullRequestSummary),
+--- }
 function M.pull_requests(opts)
   opts = opts or {}
-  if not opts.states then
-    opts.states = { "OPEN" }
-  end
-
-  local repo = utils.pop_key(opts, "repo")
-  if utils.is_blank(repo) then
-    repo = utils.get_remote_name()
-  end
-
-  if not repo then
-    utils.error "Cannot find repo"
-    return
-  end
-
-  local replace = opts.cb and create_replace(opts.cb) or open_buffer
-  utils.pop_key(opts, "cb")
-
-  local owner, name = utils.split_repo(repo)
-
+  local cb = utils.pop_key(opts, "cb")
   local cfg = octo_config.values
+  pull_requests.list(opts, function(prs)
+    local max_number = -1
+    for _, pr in ipairs(prs) do
+      max_number = math.max(max_number, #tostring(pr.ref.number))
+    end
+    opts.preview_title = opts.preview_title or ""
+    opts.prompt_title = opts.prompt_title or ""
+    opts.results_title = opts.results_title or ""
 
-  utils.info "Fetching pull requests (this may take a while) ..."
-  gh.api.graphql {
-    query = queries.pull_requests,
-    F = {
-      owner = owner,
-      name = name,
-      base_ref_name = opts.baseRefName,
-      head_ref_name = opts.headRefName,
-      labels = opts.labels,
-      states = opts.states,
-      order_by = cfg.pull_requests.order_by,
-    },
-    jq = ".",
-    paginate = true,
-    opts = {
-      cb = function(output, stderr)
-        if stderr and not utils.is_blank(stderr) then
-          utils.error(stderr)
-        elseif output then
-          local resp = utils.aggregate_pages(output, "data.repository.pullRequests.nodes")
-          local pull_requests = resp.data.repository.pullRequests.nodes
-          if #pull_requests == 0 then
-            utils.error(string.format("There are no matching pull requests in %s.", repo))
-            return
-          end
-          local max_number = -1
-          for _, pull in ipairs(pull_requests) do
-            if #tostring(pull.number) > max_number then
-              max_number = #tostring(pull.number)
-            end
-          end
-          opts.preview_title = opts.preview_title or ""
-          opts.prompt_title = opts.prompt_title or ""
-          opts.results_title = opts.results_title or ""
-          pickers
-            .new(opts, {
-              finder = finders.new_table {
-                results = pull_requests,
-                entry_maker = entry_maker.gen_from_issue(max_number),
-              },
-              sorter = conf.generic_sorter(opts),
-              previewer = previewers.issue.new(opts),
-              attach_mappings = function(_, map)
-                action_set.select:replace(replace)
-                map("i", cfg.picker_config.mappings.checkout_pr.lhs, checkout_pull_request())
-                map("i", cfg.picker_config.mappings.open_in_browser.lhs, open_in_browser())
-                map("i", cfg.picker_config.mappings.copy_url.lhs, copy_url())
-                map("i", cfg.picker_config.mappings.copy_sha.lhs, function(prompt_bufnr)
-                  local entry = action_state.get_selected_entry(prompt_bufnr)
-                  -- Fetch PR details to get the head SHA
-                  utils.info "Fetching PR details for SHA..."
-                  local owner, repo = entry.obj.repository.nameWithOwner:match "([^/]+)/(.+)"
-                  gh.api.get {
-                    "/repos/{owner}/{repo}/pulls/{pull_number}",
-                    format = { owner = owner, repo = repo, pull_number = entry.obj.number },
-                    opts = {
-                      cb = gh.create_callback {
-                        success = function(output)
-                          local pr_data = vim.json.decode(output)
-                          utils.copy_sha(pr_data.head.sha)
-                        end,
-                      },
-                    },
-                  }
-                end)
-                map("i", cfg.picker_config.mappings.merge_pr.lhs, merge_pull_request())
-                return true
-              end,
-            })
-            :find()
+    ---@param action fun(pr: octo.forge.PullRequestSummary)
+    ---@param close? boolean
+    local function on_selected(action, close)
+      return function(prompt_bufnr)
+        local entry = action_state.get_selected_entry(prompt_bufnr)
+        if close then
+          actions.close(prompt_bufnr)
         end
-      end,
-    },
-  }
+        action(entry.obj)
+      end
+    end
+
+    pickers
+      .new(opts, {
+        finder = finders.new_table {
+          results = prs,
+          entry_maker = entry_maker.gen_from_pull_request(max_number),
+        },
+        sorter = conf.generic_sorter(opts),
+        previewer = previewers.pull_request.new(opts),
+        attach_mappings = function(_, map)
+          action_set.select:replace(function(prompt_bufnr, type)
+            local entry = action_state.get_selected_entry(prompt_bufnr)
+            actions.close(prompt_bufnr)
+            if cb then
+              cb(entry.obj)
+            else
+              pull_requests.open(entry.obj, type)
+            end
+          end)
+          local mappings = cfg.picker_config.mappings
+          map("i", mappings.checkout_pr.lhs, on_selected(pull_requests.checkout, true))
+          map("i", mappings.open_in_browser.lhs, on_selected(pull_requests.browse, true))
+          map("i", mappings.copy_url.lhs, on_selected(pull_requests.copy_url))
+          map("i", mappings.copy_sha.lhs, on_selected(pull_requests.copy_sha))
+          map("i", mappings.merge_pr.lhs, on_selected(pull_requests.merge, true))
+          return true
+        end,
+      })
+      :find()
+  end)
 end
 
 --
@@ -777,8 +742,8 @@ end
 function M.pending_threads(threads)
   local max_linenr_length = -1
   for _, thread in ipairs(threads) do
-    max_linenr_length = math.max(max_linenr_length, #tostring(thread.startLine))
-    max_linenr_length = math.max(max_linenr_length, #tostring(thread.line))
+    local lines = thread.lines or thread.original_lines or { first = 1, last = 1 }
+    max_linenr_length = math.max(max_linenr_length, #tostring(lines.first), #tostring(lines.last))
   end
   pickers
     .new({}, {

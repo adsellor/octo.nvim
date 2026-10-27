@@ -416,7 +416,7 @@ end
 M.FilePanel = FilePanel
 
 ---@param path string
----@return octo.ReviewThread[]
+---@return octo.forge.Thread[]
 function M.threads_for_path(path)
   local current_review = require("octo.reviews").get_current_review()
   if not current_review then
@@ -438,18 +438,17 @@ function M.thread_counts(path)
   local pending = 0
   local active = 0
   for _, thread in pairs(threads) do
-    if not thread.isOutdated and not thread.isResolved and #thread.comments.nodes > 0 then
+    if not thread.outdated and not thread.resolved and #thread.comments > 0 then
       active = active + 1
     end
-    if thread.isOutdated and #thread.comments.nodes > 0 then
+    if thread.outdated and #thread.comments > 0 then
       outdated = outdated + 1
     end
-    if thread.isResolved and #thread.comments.nodes > 0 then
+    if thread.resolved and #thread.comments > 0 then
       resolved = resolved + 1
     end
-    for _, comment in ipairs(thread.comments.nodes) do
-      local review = comment.pullRequestReview
-      if not utils.is_blank(review) and review.state == "PENDING" and not utils.is_blank(utils.trim(comment.body)) then
+    for _, comment in ipairs(thread.comments) do
+      if comment.pending and not utils.is_blank(utils.trim(comment.body)) then
         pending = pending + 1
       end
     end
@@ -464,8 +463,9 @@ function M.next_thread()
   local candidate = math.huge
   if path then
     for _, thread in ipairs(M.threads_for_path(path)) do
-      if thread.startLine > current_line and thread.startLine < candidate then
-        candidate = thread.startLine
+      local first = thread.lines and thread.lines.first
+      if first and first > current_line and first < candidate then
+        candidate = first
       end
     end
   end
@@ -481,8 +481,9 @@ function M.prev_thread()
   local candidate = -1
   if path then
     for _, thread in ipairs(M.threads_for_path(path)) do
-      if thread.originalLine < current_line and thread.originalLine > candidate then
-        candidate = thread.originalLine
+      local first = thread.lines and thread.lines.first
+      if first and first < current_line and first > candidate then
+        candidate = first
       end
     end
   end

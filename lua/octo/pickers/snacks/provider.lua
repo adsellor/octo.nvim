@@ -6,6 +6,7 @@ local queries = require "octo.gh.queries"
 local utils = require "octo.utils"
 local octo_config = require "octo.config"
 local navigation = require "octo.navigation"
+local pull_requests = require "octo.pull-requests"
 local Async = require "snacks.picker.util.async"
 local Snacks = require "snacks"
 local notify = require "snacks.notify"
@@ -151,176 +152,119 @@ end
 
 function M.pull_requests(opts)
   opts = opts or {}
-  if not opts.states then
-    opts.states = { "OPEN" }
-  end
-
-  local repo = utils.pop_key(opts, "repo")
-  if utils.is_blank(repo) then
-    repo = utils.get_remote_name()
-  end
-
-  if not repo then
-    utils.error "Cannot find repo"
-    return
-  end
-
-  local owner, name = utils.split_repo(repo)
-
+  local cb = utils.pop_key(opts, "cb")
   local cfg = octo_config.values
-
   local preview_title = utils.pop_key(opts, "preview_title") or "Pull Requests"
 
-  utils.info "Fetching pull requests (this may take a while) ..."
-  gh.api.graphql {
-    query = queries.pull_requests,
-    F = {
-      owner = owner,
-      name = name,
-      base_ref_name = opts.baseRefName,
-      head_ref_name = opts.headRefName,
-      labels = opts.labels,
-      states = opts.states,
-      order_by = cfg.pull_requests.order_by,
-    },
-    paginate = true,
-    jq = ".",
-    opts = {
-      cb = function(output, stderr)
-        if stderr and not utils.is_blank(stderr) then
-          utils.error(stderr)
-        elseif output then
-          local resp = utils.aggregate_pages(output, "data.repository.pullRequests.nodes")
-          local pull_requests = resp.data.repository.pullRequests.nodes
-          if #pull_requests == 0 then
-            utils.error(string.format("There are no matching pull requests in %s.", repo))
-            return
-          end
-          local max_number = -1
-          for _, pull in ipairs(pull_requests) do
-            if pull.number > max_number then
-              max_number = pull.number
-            end
-            pull.text = string.format("#%d %s", pull.number, pull.title)
-            local stack_indicator = utils.get_stack_indicator(pull)
-            if stack_indicator then
-              pull.text = pull.text .. "  " .. stack_indicator
-            end
-            pull.file = utils.get_pull_request_uri(pull.number, pull.repository.nameWithOwner)
-            pull.kind = pull.__typename:lower() == "pullrequest" and "pull_request" or "unknown"
-          end
+  pull_requests.list(opts, function(prs)
+    local max_number = -1
+    local items = {}
+    for _, pr in ipairs(prs) do
+      max_number = math.max(max_number, pr.ref.number)
+      local text = string.format("#%d %s", pr.ref.number, pr.title)
+      local stack_indicator = pull_requests.stack_indicator(pr)
+      if stack_indicator then
+        text = text .. "  " .. stack_indicator
+      end
+      -- number, title, url and repository keep custom actions written for the GitHub items working
+      table.insert(items, {
+        pr = pr,
+        text = text,
+        file = pull_requests.uri(pr),
+        kind = "pull_request",
+        number = pr.ref.number,
+        title = pr.title,
+        url = pr.url,
+        repository = { nameWithOwner = pull_requests.repo_name(pr) },
+      })
+    end
 
-          -- Prepare actions and keys for Snacks
-          local final_actions = {}
-          local final_keys = {}
-          local default_mode = { "n", "i" }
+    -- Prepare actions and keys for Snacks
+    local final_actions = {}
+    local final_keys = {}
+    local default_mode = { "n", "i" }
 
-          -- Process custom actions from config array
-          local custom_actions_defined = {}
-          if
-            cfg.picker_config.snacks
-            and cfg.picker_config.snacks.actions
-            and cfg.picker_config.snacks.actions.pull_requests
-          then
-            for _, action_item in ipairs(cfg.picker_config.snacks.actions.pull_requests) do
-              if action_item.name and action_item.fn then
-                final_actions[action_item.name] = action_item.fn
-                custom_actions_defined[action_item.name] = true
-                if action_item.lhs then
-                  final_keys[action_item.lhs] = { action_item.name, mode = action_item.mode or default_mode }
-                end
-              end
-            end
+    -- Process custom actions from config array
+    local custom_actions_defined = {}
+    if
+      cfg.picker_config.snacks
+      and cfg.picker_config.snacks.actions
+      and cfg.picker_config.snacks.actions.pull_requests
+    then
+      for _, action_item in ipairs(cfg.picker_config.snacks.actions.pull_requests) do
+        if action_item.name and action_item.fn then
+          final_actions[action_item.name] = action_item.fn
+          custom_actions_defined[action_item.name] = true
+          if action_item.lhs then
+            final_keys[action_item.lhs] = { action_item.name, mode = action_item.mode or default_mode }
           end
+        end
+      end
+    end
 
-          -- Add default actions/keys if not overridden
-          if not custom_actions_defined["open_in_browser"] then
-            final_actions["open_in_browser"] = function(_picker, item)
-              navigation.open_in_browser(item.kind, item.repository.nameWithOwner, item.number)
-            end
-          end
-          if not final_keys[cfg.picker_config.mappings.open_in_browser.lhs] then
-            final_keys[cfg.picker_config.mappings.open_in_browser.lhs] = { "open_in_browser", mode = default_mode }
-          end
+    ---Add a default action under `name`, bound to `lhs`, unless the config already did.
+    ---@param name string
+    ---@param lhs string
+    ---@param action fun(pr: octo.forge.PullRequestSummary)
+    local function default_action(name, lhs, action)
+      if not custom_actions_defined[name] then
+        final_actions[name] = function(_picker, item)
+          action(item.pr)
+        end
+      end
+      if not final_keys[lhs] then
+        final_keys[lhs] = { name, mode = default_mode }
+      end
+    end
+    local mappings = cfg.picker_config.mappings
+    default_action("open_in_browser", mappings.open_in_browser.lhs, pull_requests.browse)
+    default_action("copy_url", mappings.copy_url.lhs, pull_requests.copy_url)
+    default_action("check_out_pr", mappings.checkout_pr.lhs, pull_requests.checkout)
+    default_action("merge_pr", mappings.merge_pr.lhs, pull_requests.merge)
+    default_action("copy_sha", mappings.copy_sha.lhs, pull_requests.copy_sha)
 
-          if not custom_actions_defined["copy_url"] then
-            final_actions["copy_url"] = function(_picker, item)
-              utils.copy_url(item.url)
-            end
-          end
-          if not final_keys[cfg.picker_config.mappings.copy_url.lhs] then
-            final_keys[cfg.picker_config.mappings.copy_url.lhs] = { "copy_url", mode = default_mode }
-          end
-
-          if not custom_actions_defined["check_out_pr"] then
-            final_actions["check_out_pr"] = function(_picker, item)
-              utils.checkout_pr(item.number)
-            end
-          end
-          if not final_keys[cfg.picker_config.mappings.checkout_pr.lhs] then
-            final_keys[cfg.picker_config.mappings.checkout_pr.lhs] = { "check_out_pr", mode = default_mode }
-          end
-
-          if not custom_actions_defined["merge_pr"] then
-            final_actions["merge_pr"] = function(_picker, item)
-              utils.merge_pr(item.number)
-            end
-          end
-          if not final_keys[cfg.picker_config.mappings.merge_pr.lhs] then
-            final_keys[cfg.picker_config.mappings.merge_pr.lhs] = { "merge_pr", mode = default_mode }
-          end
-
-          if not custom_actions_defined["copy_sha"] then
-            final_actions["copy_sha"] = function(_picker, item)
-              -- Fetch PR details to get the head SHA
-              utils.info "Fetching PR details for SHA..."
-              local owner, repo = utils.split_repo(item.repository.nameWithOwner)
-              gh.api.get {
-                "/repos/{owner}/{repo}/pulls/{pull_number}",
-                format = { owner = owner, repo = repo, pull_number = item.number },
-                opts = {
-                  cb = gh.create_callback {
-                    success = function(output)
-                      local pr_data = vim.json.decode(output)
-                      utils.copy_sha(pr_data.head.sha)
-                    end,
-                  },
-                },
-              }
-            end
-          end
-          if not final_keys[cfg.picker_config.mappings.copy_sha.lhs] then
-            final_keys[cfg.picker_config.mappings.copy_sha.lhs] = { "copy_sha", mode = default_mode }
-          end
-
-          Snacks.picker.pick {
-            title = preview_title,
-            items = pull_requests,
-            format = function(item, _)
-              ---@type snacks.picker.Highlight[]
-              local ret = {}
-              ---@diagnostic disable-next-line: assign-type-mismatch
-              ret[#ret + 1] = utils.get_icon { kind = item.kind, obj = item }
-              ret[#ret + 1] = { string.format("#%d", item.number), "Comment" }
-              ret[#ret + 1] = { (" "):rep(#tostring(max_number) - #tostring(item.number) + 1) }
-              ret[#ret + 1] = { item.title, "Normal" }
-              local stack_indicator = utils.get_stack_indicator(item)
-              if stack_indicator then
-                ret[#ret + 1] = { "  " .. stack_indicator, "Comment" }
-              end
-              return ret
-            end,
-            win = {
-              input = {
-                keys = final_keys, -- Use the constructed keys map
-              },
-            },
-            actions = final_actions, -- Use the constructed actions map
-          }
+    Snacks.picker.pick {
+      title = preview_title,
+      items = items,
+      format = function(item, _)
+        local pr = item.pr ---@type octo.forge.PullRequestSummary
+        ---@type snacks.picker.Highlight[]
+        local ret = {}
+        ---@diagnostic disable-next-line: assign-type-mismatch
+        ret[#ret + 1] = pull_requests.icon(pr)
+        ret[#ret + 1] = { string.format("#%d", pr.ref.number), "Comment" }
+        ret[#ret + 1] = { (" "):rep(#tostring(max_number) - #tostring(pr.ref.number) + 1) }
+        ret[#ret + 1] = { pr.title, "Normal" }
+        local stack_indicator = pull_requests.stack_indicator(pr)
+        if stack_indicator then
+          ret[#ret + 1] = { "  " .. stack_indicator, "Comment" }
+        end
+        return ret
+      end,
+      preview = function(ctx)
+        if not ctx.item then
+          return
+        end
+        ctx.preview:reset()
+        ctx.preview:set_lines((pull_requests.preview_lines(ctx.item.pr)))
+        ctx.preview:highlight { ft = "markdown" }
+      end,
+      confirm = function(picker, item)
+        picker:close()
+        if cb then
+          cb(item.pr)
+        else
+          pull_requests.open(item.pr)
         end
       end,
-    },
-  }
+      win = {
+        input = {
+          keys = final_keys, -- Use the constructed keys map
+        },
+      },
+      actions = final_actions, -- Use the constructed actions map
+    }
+  end)
 end
 
 ---@param opts {

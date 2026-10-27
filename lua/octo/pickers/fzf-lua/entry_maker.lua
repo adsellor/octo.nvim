@@ -115,9 +115,10 @@ function M.gen_from_review_thread(linenr_length, thread)
     return nil
   end
 
+  local lines = thread.lines or thread.original_lines or { first = 1, last = 1 }
   return {
-    value = thread.path .. ":" .. thread.startLine .. ":" .. thread.line,
-    ordinal = thread.path .. ":" .. thread.startLine .. ":" .. thread.line,
+    value = thread.path .. ":" .. lines.first .. ":" .. lines.last,
+    ordinal = thread.path .. ":" .. lines.first .. ":" .. lines.last,
     thread = thread,
   }
 end

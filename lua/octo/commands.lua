@@ -601,9 +601,7 @@ function M.setup()
 
         if not buffer or not buffer:isPullRequest() then
           picker.prs {
-            cb = function(selected)
-              utils.checkout_pr(selected.obj.number)
-            end,
+            cb = require("octo.pull-requests").checkout,
           }
           return
         end
@@ -857,7 +855,7 @@ function M.setup()
           -- for now, we cannot create comments.
           -- TODO: implement 'non-review' commits here, which adds a diff commit
           -- but outside of a review.
-          if current_review.id == -1 then
+          if not current_review.started then
             utils.error "Please start or resume a review first"
             return
           end
@@ -1302,15 +1300,14 @@ function M.add_pr_issue_or_review_thread_comment(body)
 
     -- are we trying to add a review comment while in 'review browse' mode?
     local current_review = reviews.get_current_review()
-    if current_review == nil or current_review.id == -1 then
+    if current_review == nil or not current_review.started then
       utils.error "Please start or resume a review first"
       return
     end
 
-    comment.pullRequestReview = { id = current_review.id }
+    -- in review thread buffers a reply names its thread
     comment.state = "PENDING"
-    comment.replyTo = _thread.replyTo
-    comment.replyToRest = _thread.replyToRest
+    comment.replyTo = _thread.threadId
   elseif not utils.is_blank(_thread) and not buffer:isReviewThread() then
     comment_kind = "PullRequestComment"
     comment.state = ""
@@ -1439,112 +1436,50 @@ function M.delete_comment()
     return
   end
 
-  local choice = vim.fn.confirm("Delete comment?", "&Yes\n&No\n&Cancel", 2)
-  if choice == 1 then
-    gh.api.graphql {
-      f = { query = query },
-      opts = {
-        cb = gh.create_callback {
-          success = function(output)
-            -- TODO: deleting the last review thread comment, it deletes the whole thread and review
-            -- In issue buffers, we should hide the thread snippet
-            local resp = vim.json.decode(output)
-
-            -- remove comment lines from the buffer
-            if comment.reactionLine then
-              vim.api.nvim_buf_set_lines(buffer.bufnr, start_line - 2, end_line + 1, false, {})
-              vim.api.nvim_buf_clear_namespace(
-                buffer.bufnr,
-                constants.OCTO_REACTIONS_VT_NS,
-                start_line - 2,
-                end_line + 1
-              )
-            else
-              vim.api.nvim_buf_set_lines(buffer.bufnr, start_line - 2, end_line - 1, false, {})
-            end
-            vim.api.nvim_buf_clear_namespace(buffer.bufnr, comment.namespace, 0, -1)
-            vim.api.nvim_buf_del_extmark(buffer.bufnr, constants.OCTO_COMMENT_NS, comment.extmark)
-            local comments = buffer.commentsMetadata
-            if comments then
-              local updated = {}
-              for _, c in ipairs(comments) do
-                if c.id ~= comment.id then
-                  table.insert(updated, c)
-                end
-              end
-              buffer.commentsMetadata = updated
-            end
-
-            if comment.kind == "PullRequestReviewComment" then
-              local review = reviews.get_current_review()
-              if not review then
-                utils.error "Cannot find review for this comment"
-                return
-              end
-
-              local threads = resp.data.deletePullRequestReviewComment.pullRequestReview.pullRequest.reviewThreads.nodes
-
-              -- check if there is still at least a PENDING comment
-              local review_was_deleted = true
-              for _, thread in ipairs(threads) do
-                for _, c in ipairs(thread.comments.nodes) do
-                  if c.state == "PENDING" then
-                    review_was_deleted = false
-                    break
-                  end
-                end
-              end
-              if review_was_deleted then
-                -- we deleted the last pending comment and therefore GitHub closed the review, create a new one
-                review:create(function(resp)
-                  review.id = resp.data.addPullRequestReview.pullRequestReview.id
-                  local updated_threads =
-                    resp.data.addPullRequestReview.pullRequestReview.pullRequest.reviewThreads.nodes
-                  review:update_threads(updated_threads)
-                end)
-              else
-                review:update_threads(threads)
-              end
-
-              -- check if we removed the last comment of a thread
-              local thread_was_deleted = true
-              for _, thread in ipairs(threads) do
-                if threadId == thread.id then
-                  thread_was_deleted = false
-                  break
-                end
-              end
-              if thread_was_deleted then
-                -- this was the last comment, close the thread buffer
-                -- No comments left
-                utils.error("Deleting buffer " .. tostring(buffer.bufnr))
-                local bufname = vim.api.nvim_buf_get_name(buffer.bufnr)
-                local split = string.match(bufname, "octo://.+/review/[^/]+/threads/([^/]+)/.*")
-                if split then
-                  local layout = reviews.get_current_review().layout
-                  local file = layout:get_current_file()
-                  if not file then
-                    return
-                  end
-                  local thread_win = file:get_alternative_win(split)
-                  local original_buf = file:get_alternative_buf(split)
-                  -- move focus to the split containing the diff buffer
-                  -- restore the diff buffer so that window is not closed when deleting thread buffer
-                  vim.api.nvim_win_set_buf(thread_win, original_buf)
-                  -- delete the thread buffer
-                  pcall(vim.api.nvim_buf_delete, buffer.bufnr, { force = true })
-                  -- refresh signs and virtual text
-                  file:place_signs()
-                  -- diff buffers
-                  file:show_diff()
-                end
-              end
-            end -- if comment.kind == "PullRequestReviewComment"
-          end,
-        },
-      },
-    }
+  local function remove_from_buffer()
+    if comment.reactionLine then
+      vim.api.nvim_buf_set_lines(buffer.bufnr, start_line - 2, end_line + 1, false, {})
+      vim.api.nvim_buf_clear_namespace(buffer.bufnr, constants.OCTO_REACTIONS_VT_NS, start_line - 2, end_line + 1)
+    else
+      vim.api.nvim_buf_set_lines(buffer.bufnr, start_line - 2, end_line - 1, false, {})
+    end
+    vim.api.nvim_buf_clear_namespace(buffer.bufnr, comment.namespace, 0, -1)
+    vim.api.nvim_buf_del_extmark(buffer.bufnr, constants.OCTO_COMMENT_NS, comment.extmark)
+    local comments = buffer.commentsMetadata
+    if comments then
+      local updated = {}
+      for _, c in ipairs(comments) do
+        if c.id ~= comment.id then
+          table.insert(updated, c)
+        end
+      end
+      buffer.commentsMetadata = updated
+    end
   end
+
+  local choice = vim.fn.confirm("Delete comment?", "&Yes\n&No\n&Cancel", 2)
+  if choice ~= 1 then
+    return
+  end
+  if buffer:isReviewThread() then
+    require("octo.reviews.thread-buffer").delete(buffer, comment, threadId, remove_from_buffer)
+    return
+  end
+  gh.api.graphql {
+    f = { query = query },
+    opts = {
+      cb = gh.create_callback {
+        success = function()
+          remove_from_buffer()
+          -- a review open on this pull request shows the same threads
+          local review = reviews.get_current_review()
+          if review and comment.kind == "PullRequestReviewComment" then
+            review:refresh_threads()
+          end
+        end,
+      },
+    },
+  }
 end
 
 function M.comment_edits()
@@ -1605,10 +1540,10 @@ local function update_review_thread_header(bufnr, thread, thread_id, thread_line
     isOutdated = thread.isOutdated,
     isResolved = thread.isResolved,
   }, thread_line - 2)
-  local threads = thread.pullRequest.reviewThreads.nodes
+  -- a review open on this pull request shows the same threads
   local review = reviews.get_current_review()
   if review then
-    review:update_threads(threads)
+    review:refresh_threads()
   end
 end
 
@@ -1621,6 +1556,10 @@ function M.resolve_thread()
 
   local _thread = buffer:get_thread_at_cursor()
   if not _thread then
+    return
+  end
+  if buffer:isReviewThread() then
+    require("octo.reviews.thread-buffer").resolve(buffer, _thread, true)
     return
   end
   local thread_id = _thread.threadId
@@ -1651,6 +1590,10 @@ function M.unresolve_thread()
   end
   local _thread = buffer:get_thread_at_cursor()
   if not _thread then
+    return
+  end
+  if buffer:isReviewThread() then
+    require("octo.reviews.thread-buffer").resolve(buffer, _thread, false)
     return
   end
   local thread_id = _thread.threadId
@@ -2554,6 +2497,31 @@ function M.reaction_action(reaction)
     return
   end
 
+  local function show(groups)
+    reaction_groups = groups
+    buffer:update_reactions_at_cursor(reaction_groups, reaction_line)
+    if action == "remove" and utils.count_reactions(reaction_groups) == 0 then
+      -- delete lines
+      vim.api.nvim_buf_set_lines(buffer.bufnr, reaction_line - 1, reaction_line + 1, false, {})
+      vim.api.nvim_buf_clear_namespace(
+        buffer.bufnr,
+        constants.OCTO_REACTIONS_VT_NS,
+        reaction_line - 1,
+        reaction_line + 1
+      )
+    elseif action == "add" and insert_line then
+      -- add lines
+      vim.api.nvim_buf_set_lines(buffer.bufnr, reaction_line - 1, reaction_line - 1, false, { "", "" })
+    end
+    writers.write_reactions(buffer.bufnr, reaction_groups, reaction_line)
+    buffer:update_metadata()
+  end
+
+  if buffer:isReviewThread() then
+    require("octo.reviews.thread-buffer").react(id, reaction, action == "add", show)
+    return
+  end
+
   -- add/delete reaction
   local query = graphql(action .. "_reaction_mutation", id, reaction)
   gh.api.graphql {
@@ -2563,27 +2531,10 @@ function M.reaction_action(reaction)
         success = function(output)
           local resp = vim.json.decode(output)
           if action == "add" then
-            reaction_groups = resp.data.addReaction.subject.reactionGroups
+            show(resp.data.addReaction.subject.reactionGroups)
           elseif action == "remove" then
-            reaction_groups = resp.data.removeReaction.subject.reactionGroups
+            show(resp.data.removeReaction.subject.reactionGroups)
           end
-
-          buffer:update_reactions_at_cursor(reaction_groups, reaction_line)
-          if action == "remove" and utils.count_reactions(reaction_groups) == 0 then
-            -- delete lines
-            vim.api.nvim_buf_set_lines(buffer.bufnr, reaction_line - 1, reaction_line + 1, false, {})
-            vim.api.nvim_buf_clear_namespace(
-              buffer.bufnr,
-              constants.OCTO_REACTIONS_VT_NS,
-              reaction_line - 1,
-              reaction_line + 1
-            )
-          elseif action == "add" and insert_line then
-            -- add lines
-            vim.api.nvim_buf_set_lines(buffer.bufnr, reaction_line - 1, reaction_line - 1, false, { "", "" })
-          end
-          writers.write_reactions(buffer.bufnr, reaction_groups, reaction_line)
-          buffer:update_metadata()
         end,
       },
     },

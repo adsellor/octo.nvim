@@ -8,8 +8,8 @@ local reviews = require "octo.reviews"
 return function(threads)
   local max_linenr_length = -1
   for _, thread in ipairs(threads) do
-    max_linenr_length = math.max(max_linenr_length, #tostring(thread.startLine))
-    max_linenr_length = math.max(max_linenr_length, #tostring(thread.line))
+    local lines = thread.lines or thread.original_lines or { first = 1, last = 1 }
+    max_linenr_length = math.max(max_linenr_length, #tostring(lines.first), #tostring(lines.last))
   end
 
   local formatted_threads = {}
@@ -33,11 +33,11 @@ return function(threads)
     actions = {
       ["default"] = function(selected)
         local entry = formatted_threads[selected[1]]
-        reviews.jump_to_pending_review_thread(entry)
+        reviews.jump_to_pending_review_thread(entry.thread)
       end,
       ["ctrl-b"] = function(selected)
         local entry = formatted_threads[selected[1]]
-        navigation.open_in_browser_raw(entry.thread.comments.nodes[1].url)
+        navigation.open_in_browser_raw(entry.thread.comments[1].url)
       end,
     },
   })

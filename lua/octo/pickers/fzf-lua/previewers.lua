@@ -107,6 +107,32 @@ function M.issue(formatted_issues)
   return previewer
 end
 
+---A forge's pull request listing, previewed from the listing itself.
+---@param by_number table<integer, octo.forge.PullRequestSummary>
+function M.pull_request(by_number)
+  ---@type octo.fzf-lua.Previewer
+  local previewer = M.bufferPreviewer:extend()
+
+  function previewer:new(o, opts, fzf_win)
+    M.bufferPreviewer.super.new(self, o, opts, fzf_win)
+    self.title = "Pull Requests"
+    setmetatable(self, previewer)
+    return self
+  end
+
+  function previewer:populate_preview_buf(entry_str)
+    local tmpbuf = self:get_tmp_buffer()
+    local pr = by_number[tonumber(entry_str:match "^(%d+)")]
+    if pr then
+      require("octo.pull-requests").preview(tmpbuf, pr)
+    end
+    self:set_preview_buf(tmpbuf)
+    self:update_border(entry_str)
+  end
+
+  return previewer
+end
+
 function M.search()
   ---@type octo.fzf-lua.Previewer
   local previewer = M.bufferPreviewer:extend()

@@ -1,119 +1,74 @@
 ---@diagnostic disable
-local fzf_actions = require "octo.pickers.fzf-lua.pickers.fzf_actions"
-local entry_maker = require "octo.pickers.fzf-lua.entry_maker"
 local fzf = require "fzf-lua"
-local gh = require "octo.gh"
-local queries = require "octo.gh.queries"
-local graphql = require "octo.gh.graphql"
 local octo_config = require "octo.config"
 local picker_utils = require "octo.pickers.fzf-lua.pickers.utils"
 local previewers = require "octo.pickers.fzf-lua.previewers"
+local pull_requests = require "octo.pull-requests"
 local utils = require "octo.utils"
-
-local function checkout_pull_request(entry)
-  utils.checkout_pr(entry.obj.number)
-end
-
-local function not_implemented()
-  utils.error "Not implemented yet"
-end
 
 return function(opts)
   opts = opts or {}
-  if not opts.states then
-    opts.states = { "OPEN" }
-  end
-
-  if opts.cb ~= nil then
-    not_implemented()
-    return
-  end
-
-  local repo = utils.pop_key(opts, "repo")
-  if utils.is_blank(repo) then
-    repo = utils.get_remote_name()
-  end
-  if not repo then
-    utils.error "Cannot find repo"
-    return
-  end
-
-  local owner, name = utils.split_repo(repo)
-  local cfg = octo_config.values
-
+  local cb = utils.pop_key(opts, "cb")
   local window_title = utils.pop_key(opts, "window_title") or "Pull Requests"
   local prompt_title = utils.pop_key(opts, "prompt_title")
+  local cfg = octo_config.values
 
-  local formatted_pulls = {} ---@type table<string, table> entry.ordinal -> entry
+  pull_requests.list(opts, function(prs)
+    local by_number = {} ---@type table<integer, octo.forge.PullRequestSummary>
+    local lines = {} ---@type string[]
+    for _, pr in ipairs(prs) do
+      by_number[pr.ref.number] = pr
+      local title = pr.title
+      local stack_indicator = pull_requests.stack_indicator(pr)
+      if stack_indicator then
+        title = title .. "  " .. fzf.utils.ansi_from_hl("Comment", stack_indicator)
+      end
+      local icon = pull_requests.icon(pr)
+      table.insert(lines, fzf.utils.ansi_from_hl(icon[2], tostring(pr.ref.number)) .. " " .. title)
+    end
 
-  local function get_contents(fzf_cb)
-    gh.api.graphql {
-      query = queries.pull_requests,
-      F = {
-        owner = owner,
-        name = name,
-        base_ref_name = opts.BaseRefName,
-        head_ref_name = opts.HeadRefName,
-        labels = opts.labels,
-        states = opts.states,
-        order_by = cfg.pull_requests.order_by,
+    ---@param selected string[]
+    local function picked(selected)
+      return by_number[tonumber(selected[1]:match "^(%d+)")]
+    end
+    ---@param split "default"|"horizontal"|"vertical"|"tab"
+    local function open(split)
+      return function(selected)
+        if cb then
+          cb(picked(selected))
+        else
+          pull_requests.open(picked(selected), split)
+        end
+      end
+    end
+    ---@param action fun(pr: octo.forge.PullRequestSummary)
+    local function on_picked(action)
+      return function(selected)
+        action(picked(selected))
+      end
+    end
+
+    local mappings = cfg.picker_config.mappings
+    fzf.fzf_exec(lines, {
+      prompt = picker_utils.get_prompt(prompt_title),
+      previewer = previewers.pull_request(by_number),
+      fzf_opts = {
+        ["--no-multi"] = "", -- TODO this can support multi, maybe.
+        ["--info"] = "default",
       },
-      paginate = true,
-      jq = ".",
-      opts = {
-        stream_cb = function(data, err)
-          if err and not utils.is_blank(err) then
-            utils.error(err)
-            fzf_cb()
-          elseif data then
-            local resp = utils.aggregate_pages(data, "data.repository.pullRequests.nodes")
-            local pull_requests = resp.data.repository.pullRequests.nodes
-
-            for _, pull in ipairs(pull_requests) do
-              local entry = entry_maker.gen_from_issue(pull)
-
-              if entry ~= nil then
-                formatted_pulls[entry.ordinal] = entry
-                local highlight
-                if entry.obj.isDraft then
-                  highlight = "OctoSymbol"
-                else
-                  highlight = "OctoStateOpen"
-                end
-                local prefix = fzf.utils.ansi_from_hl(highlight, entry.value)
-                local title = entry.obj.title
-                local stack_indicator = utils.get_stack_indicator(entry.obj)
-                if stack_indicator then
-                  title = title .. "  " .. fzf.utils.ansi_from_hl("Comment", stack_indicator)
-                end
-                fzf_cb(prefix .. " " .. title)
-              end
-            end
-          end
-        end,
-        cb = function()
-          fzf_cb()
-        end,
+      winopts = {
+        title = window_title,
+        title_pos = "center",
       },
-    }
-  end
-
-  fzf.fzf_exec(get_contents, {
-    prompt = picker_utils.get_prompt(prompt_title),
-    previewer = previewers.issue(formatted_pulls),
-    fzf_opts = {
-      ["--no-multi"] = "", -- TODO this can support multi, maybe.
-      ["--info"] = "default",
-    },
-    winopts = {
-      title = window_title,
-      title_pos = "center",
-    },
-    actions = vim.tbl_extend("force", fzf_actions.common_open_actions(formatted_pulls), {
-      [utils.convert_vim_mapping_to_fzf(cfg.picker_config.mappings.checkout_pr.lhs)] = function(selected)
-        local entry = formatted_pulls[selected[1]]
-        checkout_pull_request(entry)
-      end,
-    }),
-  })
+      actions = {
+        ["default"] = open "default",
+        ["ctrl-v"] = open "vertical",
+        ["ctrl-s"] = open "horizontal",
+        ["ctrl-t"] = open "tab",
+        [utils.convert_vim_mapping_to_fzf(mappings.open_in_browser.lhs)] = on_picked(pull_requests.browse),
+        [utils.convert_vim_mapping_to_fzf(mappings.copy_url.lhs)] = on_picked(pull_requests.copy_url),
+        [utils.convert_vim_mapping_to_fzf(mappings.checkout_pr.lhs)] = on_picked(pull_requests.checkout),
+      },
+    })
+  end)
 end
